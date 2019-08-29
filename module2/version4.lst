@@ -1,0 +1,1552 @@
+0000              1   ; ISR_example.asm: a) Increments/decrements a BCD variable every half second using
+0000              2   ; an ISR for timer 2; b) Generates a 2kHz square wave at pin P3.7 using
+0000              3   ; an ISR for timer 0; and c) in the 'main' loop it displays the variable
+0000              4   ; incremented/decremented using the ISR for timer 0 on the LCD.  Also resets it to 
+0000              5   ; zero if the 'BOOT' pushbutton connected to P4.5 is pressed.
+                  7   $LIST
+0000              9   
+0000             10   CLK           EQU 22118400 ; Microcontroller system crystal frequency in Hz
+0000             11   TIMER0_RATE   EQU 4096     ; 2048Hz squarewave (peak amplitude of CEM-1203 speaker)
+0000             12   TIMER0_RELOAD EQU ((65536-(CLK/TIMER0_RATE)))
+0000             13   TIMER2_RATE   EQU 1000     ; 1000Hz, for a timer tick of 1ms
+0000             14   TIMER2_RELOAD EQU ((65536-(CLK/TIMER2_RATE)))
+0000             15   
+0000             16   BOOT_BUTTON   equ P4.5
+0000             17   SOUND_OUT     equ P3.7
+0000             18   UPDOWN        equ P0.0
+0000             19   
+0000             20   ; Reset vector
+0000             21   org 0000H
+0000 020290      22       ljmp main
+0003             23   
+0003             24   ; External interrupt 0 vector (not used in this code)
+0003             25   org 0003H
+0003 32          26            reti
+0004             27   
+0004             28   ; Timer/Counter 0 overflow interrupt vector
+000B             29   org 000BH
+000B 02011F      30            ljmp Timer0_ISR
+000E             31   
+000E             32   ; External interrupt 1 vector (not used in this code)
+0013             33   org 0013H
+0013 32          34            reti
+0014             35   
+0014             36   ; Timer/Counter 1 overflow interrupt vector (not used in this code)
+001B             37   org 001BH
+001B 02015F      38                    ljmp Timer1_ISR
+001E             39   
+001E             40   ; Serial port receive/transmit interrupt vector (not used in this code)
+0023             41   org 0023H 
+0023 32          42            reti
+0024             43            
+0024             44   ; Timer/Counter 2 overflow interrupt vector
+002B             45   org 002BH
+002B 02022E      46            ljmp Timer2_ISR
+002E             47   
+0030             48   dseg at 30h
+0030             49   Count1ms:     ds 2 ; Used to determine when half second has passed
+0032             50   BCD_counter:  ds 1 ; The BCD counter incrememted in the ISR and displayed in the main loop
+0033             51   
+0033             52   second: ds 1 ;used to display clock time
+0034             53   min: ds 1
+0035             54   hours:ds 1
+0036             55   
+0036             56   position:ds 1
+0037             57   setsecond:ds 1
+0038             58   setmin:ds 1
+0039             59   sethours:ds 1
+003A             60   
+003A             61   alarmsecond:ds 1
+003B             62   alarmmin:ds 1
+003C             63   alarmhours:ds 1
+003D             64   
+003D             65   score: ds 1
+003E             66   timeringing: ds 1
+003F             67   
+003F             68   
+0000             69   bseg
+0000             70   half_seconds_flag: dbit 1 ; Set to one in the ISR every time 500 ms had passed
+0001             71   day: dbit 1
+0002             72   setday:dbit 1
+0003             73   alarmday:dbit 1
+002E             74   cseg
+002E             75   ; These 'equ' must match the wiring between the microcontroller and the LCD!
+002E             76   LCD_RS equ P1.4
+002E             77   LCD_RW equ P1.5
+002E             78   LCD_E  equ P1.6
+002E             79   LCD_D4 equ P3.2
+002E             80   LCD_D5 equ P3.3
+002E             81   LCD_D6 equ P3.4
+002E             82   LCD_D7 equ P3.5
+                 84   	$LIST
+00DC             86   
+00DC             87   ;                     1234567890123456    <- This helps determine the position of the counter
+00DC 20202020    88   Initial_Message:  db '                ', 0
+     20202020
+     20202020
+     20202020
+     00
+00ED 78783A78    89   DISPLAYTIME: db 'xx:xx:xxxx',0
+     783A7878
+     787800
+00F8 616D00      90   AMMESSAGE: db 'am',0
+00FB 706D00      91   PMMESSAGE: db 'pm',0
+00FE 30786335    92   uparrow: db '0xc5',0
+     00
+0103 72656164    93   ready: db 'ready!',0
+     792100
+010A             94   ;---------------------------------;
+010A             95   ; Routine to initialize the ISR   ;
+010A             96   ; for timer 0                     ;
+010A             97   ;---------------------------------;
+010A             98   Timer0_Init:
+010A E589        99            mov a, TMOD
+010C 54F0       100            anl a, #0xf0 ; Clear the bits for timer 0
+010E 4401       101            orl a, #0x01 ; Configure timer 0 as 16-timer
+0110 F589       102            mov TMOD, a
+0112 758CEA     103            mov TH0, #high(TIMER0_RELOAD)
+0115 758AE8     104            mov TL0, #low(TIMER0_RELOAD)
+0118            105            ; Enable the timer and interrupts
+0118 D2A9       106       setb ET0  ; Enable timer 0 interrupt
+011A D28C       107       setb TR0  ; Start timer 0
+011C D2AF       108       setb EA   ; Enable Global interrupts
+011E 22         109            ret
+011F            110   
+011F            111   ;---------------------------------;
+011F            112   ; ISR for timer 0.  Set to execute;
+011F            113   ; every 1/4096Hz to generate a    ;
+011F            114   ; 2048 Hz square wave at pin P3.7 ;
+011F            115   ;---------------------------------;
+011F            116   Timer0_ISR:
+011F            117            ; Define a latency correction for the timer reload
+011F            118            CORRECTION EQU (4+4+2+2+4+4) ; lcall+ljmp+clr+mov+mov+setb
+011F            119            ; In mode 1 we need to reload the timer.
+011F C28C       120            clr TR0
+0121 758CEA     121            mov TH0, #high(TIMER0_RELOAD+CORRECTION)
+0124 758AFC     122            mov TL0, #low(TIMER0_RELOAD+CORRECTION)
+0127 D28C       123            setb TR0
+0129 B2B7       124            cpl SOUND_OUT ; Connect speaker to P3.7!
+012B 32         125            reti
+012C            126   
+012C            127   ;---------------------------------;
+012C            128   ; Routine to initialize the ISR   ;
+012C            129   ; for timer 0                     ;
+012C            130   ;---------------------------------;
+012C            131   Timer1_Init:
+012C E589       132            mov a, TMOD
+012E 54F0       133            anl a, #0xf0 ; Clear the bits for timer 0
+0130 4401       134            orl a, #0x01 ; Configure timer 0 as 16-timer
+0132 F589       135            mov TMOD, a
+0134 758DA9     136            mov TH1, #high(TIMER2_RELOAD)
+0137 758B9A     137            mov TL1, #low(TIMER2_RELOAD)
+013A            138            ; Enable the timer and interrupts
+013A D2AB       139       setb ET1  ; Enable timer 0 interrupt
+013C D28E       140       setb TR1  ; Start timer 0
+013E D2AF       141       setb EA   ; Enable Global interrupts
+0140 22         142            ret
+0141            143   displayama:
+0141 C0E0       144            push acc
+0143 7409       144            mov a, #9
+0145 14         144            dec a
+0146 1200C1     144            lcall ?Set_Cursor_1 ; Select column and row
+0149 D0E0       144            pop acc
+014B C083       145            push dph
+014D C082       145            push dpl
+014F C0E0       145            push acc
+0151 9000F8     145            mov dptr, #AMMESSAGE
+0154 1200B4     145            lcall ?Send_Constant_String
+0157 D0E0       145            pop acc
+0159 D082       145            pop dpl
+015B D083       145            pop dph
+015D 8053       146   sjmp back
+015F            147   ;---------------------------------;
+015F            148   ; ISR for timer 0.  Set to execute;
+015F            149   ; every 1/4096Hz to generate a    ;
+015F            150   ; 2048 Hz square wave at pin P3.7 ;
+015F            151   ;---------------------------------;
+015F            152   Timer1_ISR:
+015F C0E0       153            push acc
+0161 C0D0       154            push psw
+0163            155   CHECKALARM:
+0163 C0E0       156            push acc
+0165 7401       156            mov a, #1
+0167 14         156            dec a
+0168 1200C1     156            lcall ?Set_Cursor_1 ; Select column and row
+016B D0E0       156            pop acc
+016D C083       157            push dph
+016F C082       157            push dpl
+0171 C0E0       157            push acc
+0173 9000ED     157            mov dptr, #DISPLAYTIME
+0176 1200B4     157            lcall ?Send_Constant_String
+0179 D0E0       157            pop acc
+017B D082       157            pop dpl
+017D D083       157            pop dph
+017F E503       158            mov a, alarmday
+0181 70BE       159            jnz displayama
+0183 C0E0       160            push acc
+0185 7409       160            mov a, #9
+0187 14         160            dec a
+0188 1200C1     160            lcall ?Set_Cursor_1 ; Select column and row
+018B D0E0       160            pop acc
+018D            160        ; the place in the LCD where we want the BCD counter value
+018D C000       161            push ar0
+018F A803       161            mov r0, alarmday
+0191 1200C6     161            lcall ?Display_BCD
+0194 D000       161            pop ar0
+0196 C0E0       162            push acc
+0198 7409       162            mov a, #9
+019A 14         162            dec a
+019B 1200C1     162            lcall ?Set_Cursor_1 ; Select column and row
+019E D0E0       162            pop acc
+01A0 C083       163            push dph
+01A2 C082       163            push dpl
+01A4 C0E0       163            push acc
+01A6 9000FB     163            mov dptr, #PMMESSAGE
+01A9 1200B4     163            lcall ?Send_Constant_String
+01AC D0E0       163            pop acc
+01AE D082       163            pop dpl
+01B0 D083       163            pop dph         
+01B2            164            back:
+01B2 C0E0       165            push acc
+01B4 7407       165            mov a, #7
+01B6 14         165            dec a
+01B7 1200C1     165            lcall ?Set_Cursor_1 ; Select column and row
+01BA D0E0       165            pop acc     ; the place in the LCD where we want the BCD counter value
+01BC C000       166            push ar0
+01BE A83A       166            mov r0, alarmsecond
+01C0 1200C6     166            lcall ?Display_BCD
+01C3 D000       166            pop ar0
+01C5 C0E0       167            push acc
+01C7 7401       167            mov a, #1
+01C9 14         167            dec a
+01CA 1200C1     167            lcall ?Set_Cursor_1 ; Select column and row
+01CD D0E0       167            pop acc     ; the place in the LCD where we want the BCD counter value
+01CF C000       168            push ar0
+01D1 A83C       168            mov r0, alarmhours
+01D3 1200C6     168            lcall ?Display_BCD
+01D6 D000       168            pop ar0
+01D8 C0E0       169            push acc
+01DA 7404       169            mov a, #4
+01DC 14         169            dec a
+01DD 1200C1     169            lcall ?Set_Cursor_1 ; Select column and row
+01E0 D0E0       169            pop acc     ; the place in the LCD where we want the BCD counter value
+01E2 C000       170            push ar0
+01E4 A83B       170            mov r0, alarmmin
+01E6 1200C6     170            lcall ?Display_BCD
+01E9 D000       170            pop ar0         
+01EB E501       171            mov a, day
+01ED C0E0       172            push acc
+01EF 740B       172            mov a, #11
+01F1 14         172            dec a
+01F2 1200C1     172            lcall ?Set_Cursor_1 ; Select column and row
+01F5 D0E0       172            pop acc     ; the place in the LCD where we want the BCD counter value
+01F7            173   
+01F7 9503       174            subb a, alarmday
+01F9            175            
+01F9 7019       176            jnz Inc_Done1
+01FB            177            
+01FB E535       178            mov a, hours
+01FD 953C       179            subb a, alarmhours
+01FF 7013       180            jnz Inc_Done1
+0201            181            
+0201 E534       182            mov a, min
+0203 953B       183            subb a, alarmmin
+0205 700D       184            jnz Inc_Done1
+0207            185            
+0207 E533       186            mov a, second
+0209 953A       187            subb a, alarmsecond
+020B 7007       188            jnz Inc_Done1
+020D 7400       189            mov a, #0x00
+020F F53E       190            mov timeringing, a
+0211 020371     191            Ljmp ALARMTIME
+0214            192   Inc_Done1:
+0214 D0D0       193            pop psw
+0216 D0E0       194            pop acc
+0218 32         195            reti
+0219            196   ;---------------------------------;
+0219            197   ; Routine to initialize the ISR   ;
+0219            198   ; for timer 2                     ;
+0219            199   ;---------------------------------;
+0219            200   Timer2_Init:
+0219 75C800     201            mov T2CON, #0 ; Stop timer.  Autoreload mode.
+021C            202            ; One millisecond interrupt
+021C 75CBA9     203            mov RCAP2H, #high(TIMER2_RELOAD)
+021F 75CA9A     204            mov RCAP2L, #low(TIMER2_RELOAD)
+0222            205            ; Set the 16-bit variable Count1ms to zero
+0222 E4         206            clr a
+0223 F530       207            mov Count1ms+0, a
+0225 F531       208            mov Count1ms+1, a
+0227            209            ; Enable the timer and interrupts
+0227 D2AD       210       setb ET2  ; Enable timer 2 interrupt
+0229 D2CA       211       setb TR2  ; Enable timer 2
+022B D2AF       212       setb EA   ; Enable Global interrupts
+022D 22         213            ret
+022E            214   
+022E            215   ;---------------------------------;
+022E            216   ; ISR for timer 2                 ;
+022E            217   ;---------------------------------;
+022E            218   Timer2_ISR:
+022E C2CF       219            clr TF2  ; Timer 2 doesn't clear TF2 automatically in ISR
+0230 B2B6       220            cpl P3.6 ; To check the interrupt rate with oscilloscope. It must be a 1 ms pulse.
+0232            221            
+0232            222            ; The two registers used in the ISR must be saved in the stack
+0232 C0E0       223            push acc
+0234 C0D0       224            push psw
+0236            225            
+0236            226            ; Increment the 16-bit counter
+0236 0530       227            inc Count1ms+0    ; Increment the low 8-bits first
+0238 E530       228            mov a, Count1ms+0 ; If the low 8-bits overflow, then increment high 8-bits
+023A 7002       229            jnz Inc_Done
+023C 0531       230            inc Count1ms+1
+023E            231   
+023E            232   Inc_Done:
+023E            233            ; Check if half second has passed
+023E E530       234            mov a, Count1ms+0
+0240 B4E814     235            cjne a, #low(1000), Timer2_ISR_done1
+0243 E531       236            mov a, Count1ms+1
+0245 B4030F     237            cjne a, #high(1000), Timer2_ISR_done1
+0248            238            
+0248            239            ; 500 milliseconds have passed.  Set a flag so the main program knows
+0248 D200       240            setb half_seconds_flag ; Let the main program know half second had passed
+024A B28E       241            cpl TR1 ; This line makes a beep-silence-beep-silence sound
+024C            242            ; Reset the milli-seconds counter, it is a 16-bit variable
+024C E4         243            clr a
+024D F530       244            mov Count1ms+0, a
+024F F531       245            mov Count1ms+1, a
+0251            246            ; Increment the BCD counter
+0251 E533       247            mov a, second
+0253            248   
+0253 2401       249            add a, #0x01
+0255            250            
+0255 8003       251            sjmp Timer2_ISR_da
+0257 02028B     252            Timer2_ISR_done1:ljmp Timer2_ISR_done
+025A            253   Timer2_ISR_da:
+025A D4         254            da a
+025B F533       255            mov second, a
+025D            256            
+025D E533       257            MOV a, second
+025F B46029     258            CJNE a, #0x60,Timer2_ISR_done ;makes it go back to 00, whole min has pass
+0262 753300     259            MOV second ,#0x00
+0265 E534       260            MOV a, min
+0267 2401       261            add a, #0x01 ;makes the min increase
+0269 D4         262            da a
+026A F534       263            mov min, a
+026C B4601C     264            CJNE a, #0x60, Timer2_ISR_done
+026F 753400     265            MOV min ,#0x00 ;makes it go back to 00, whole hour has pass
+0272 E535       266            MOV a, hours
+0274 2401       267            add a, #0x01 ;makes the hour increase
+0276 D4         268            da a
+0277 F535       269            mov hours, a
+0279 B41207     270            CJNE a, #0x12, hour12shift
+027C E501       271            Mov a, day 
+027E 7009       272            JNZ SwitchToPM ;switch to pm 
+0280 750101     273            mov day, #0x1
+0283            274   
+0283 B41303     275   hour12shift:     CJNE a, #0x13, SwitchToPM
+0286 753501     276            MOV hours ,#0x01 ;whole day has pass, goes to 1'clock
+0289 7400       277   SwitchToPM: mov a, #0x0 ;switch to pm
+028B            278   
+028B            279   Timer2_ISR_done:
+028B D0D0       280            pop psw
+028D D0E0       281            pop acc
+028F 32         282            reti
+0290            283   ;---------------------------------;
+0290            284   ; Main program. Includes hardware ;
+0290            285   ; initialization and 'forever'    ;
+0290            286   ; loop.                           ;
+0290            287   ;---------------------------------;
+0290            288   main:
+0290            289            ; Initialization
+0290 75817F     290       mov SP, #7FH
+0293 75C100     291       mov PMOD, #0 ; Configure all ports in bidirectional mode
+0296 12010A     292       lcall Timer0_Init
+0299 120219     293       lcall Timer2_Init
+029C 120088     294       lcall LCD_4BIT
+029F 12031B     295           lcall setarrow
+02A2            296       ; For convenience a few handy macros are included in 'LCD_4bit.inc':
+02A2 753300     297                    mov second, #0x00
+02A5 753459     298            mov min, #0x59
+02A8 753512     299            mov hours, #0x12
+02AB 750100     300            mov day, #0x0
+02AE 753A05     301                    mov alarmsecond, #0x05
+02B1 753B59     302            mov alarmmin, #0x59
+02B4 753C12     303            mov alarmhours, #0x12
+02B7 750300     304            mov alarmday, #0x0
+02BA C0E0       305            push acc
+02BC 7401       305            mov a, #1
+02BE 14         305            dec a
+02BF 1200BF     305            lcall ?Set_Cursor_2 ; Select column and row
+02C2 D0E0       305            pop acc
+02C4 C083       306            push dph
+02C6 C082       306            push dpl
+02C8 C0E0       306            push acc
+02CA 9000ED     306            mov dptr, #DISPLAYTIME
+02CD 1200B4     306            lcall ?Send_Constant_String
+02D0 D0E0       306            pop acc
+02D2 D082       306            pop dpl
+02D4 D083       306            pop dph
+02D6            307   
+02D6 D200       308       setb half_seconds_flag
+02D8 753200     309            mov BCD_counter, #0x00
+02DB            310            
+02DB            311            ; After initialization the program stays in this 'forever' loop
+02DB            312   loop:
+02DB            313   
+02DB 30A42C     314            jnb p2.4, settime1 ;check set time button
+02DE 30A52C     315            jnb p2.5, setalarm1 ;check set alarm button
+02E1            316   
+02E1            317            
+02E1 20C52C     318            jb BOOT_BUTTON, loop_a  ; if the 'BOOT' button is not pressed skip
+02E4 C002       319            push AR2
+02E6 7A32       319            mov R2, #50
+02E8 120039     319            lcall ?Wait_Milli_Seconds
+02EB D002       319            pop AR2         ; Debounce delay.  This macro is also in 'LCD_4bit.inc'
+02ED 20C520     320            jb BOOT_BUTTON, loop_a  ; if the 'BOOT' button is not pressed skip
+02F0 30C5FD     321            jnb BOOT_BUTTON, $              ; wait for button release
+02F3            322            ; A clean press of the 'BOOT' button has been detected, reset the BCD counter.
+02F3            323            ; But first stop the timer and reset the milli-seconds counter, to resync everything.
+02F3 C28C       324            clr TR0
+02F5 E4         325            clr a
+02F6 F530       326            mov Count1ms+0, a
+02F8 F531       327            mov Count1ms+1, a
+02FA            328            ; Now clear the BCD counter
+02FA 753300     329                    mov second, #0x00
+02FD 753459     330            mov min, #0x59
+0300 753512     331            mov hours, #0x12
+0303 750100     332            mov day, #0x0
+0306 D28C       333                    setb TR0                ; Re-enable the timer
+0308 8009       334            sjmp loop_b             ; Display the new value
+030A            335   
+030A 0208A9     336   settime1:ljmp settime ;mid jump due to jnz/cjnz 
+030D 0208A4     337   setalarm1:ljmp setalarm;mid jump due to jnz/cjnz 
+0310            338   
+0310            339   loop_a:
+0310 3000C8     340            jnb half_seconds_flag, loop
+0313            341   loop_b:
+0313 C200       342       clr half_seconds_flag ; We clear this flag in the main loop, but it is set in the ISR for timer 0
+0315 120B08     343   lcall SHOWTIME
+0318            344   
+0318 0202DB     345   loop1:ljmp loop
+031B            346   
+031B            347   setarrow:
+031B 7440       348            mov a, #0x40 ; add up and down arrows
+031D 120083     349       lcall ?WriteCommand
+0320 7400       350       mov a, #0x00
+0322 12007E     351       lcall ?WriteData
+0325 7404       352       mov a, #0x04
+0327 12007E     353       lcall ?WriteData  
+032A 7404       354       mov a, #0x04
+032C 12007E     355       lcall ?WriteData 
+032F 7404       356       mov a, #0x04 
+0331 12007E     357       lcall ?WriteData
+0334 7415       358       mov a, #0x15
+0336 12007E     359       lcall ?WriteData 
+0339 740E       360       mov a, #0x0e
+033B 12007E     361       lcall ?WriteData
+033E 7404       362       mov a, #0x04 
+0340 12007E     363       lcall ?WriteData
+0343 7400       364       mov a, #0x00   
+0345 12007E     365       lcall ?WriteData
+0348 7400       366       mov a, #0x00
+034A 12007E     367       lcall ?WriteData
+034D 7404       368       mov a, #0x04
+034F 12007E     369       lcall ?WriteData  
+0352 740E       370       mov a, #0x0e
+0354 12007E     371       lcall ?WriteData 
+0357 7415       372       mov a, #0x15 
+0359 12007E     373       lcall ?WriteData
+035C 7404       374       mov a, #0x04
+035E 12007E     375       lcall ?WriteData 
+0361 7404       376       mov a, #0x04
+0363 12007E     377       lcall ?WriteData
+0366 7404       378       mov a, #0x04 
+0368 12007E     379       lcall ?WriteData
+036B 7400       380       mov a, #0x00   
+036D 12007E     381       lcall ?WriteData
+0370 22         382            RET
+0371            383   ALARMTIME:
+0371            384   
+0371            385   
+0371 E53E       386   mov a, timeringing
+0373 2401       387   add a, #0x01
+0375 F53E       388   mov timeringing,a
+0377 C0E0       389            push acc
+0379 740F       389            mov a, #15
+037B 14         389            dec a
+037C 1200C1     389            lcall ?Set_Cursor_1 ; Select column and row
+037F D0E0       389            pop acc
+0381 C000       390            push ar0
+0383 A83E       390            mov r0, timeringing
+0385 1200C6     390            lcall ?Display_BCD
+0388 D000       390            pop ar0
+038A C002       391            push AR2
+038C 7A96       391            mov R2, #150
+038E 120039     391            lcall ?Wait_Milli_Seconds
+0391 D002       391            pop AR2
+0393            392   
+0393 120690     393   lcall playmario
+0396 7400       394   mov a, #0x00
+0398 F53D       395   mov score, a
+039A C0E0       396            push acc
+039C 7401       396            mov a, #1
+039E 14         396            dec a
+039F 1200BF     396            lcall ?Set_Cursor_2 ; Select column and row
+03A2 D0E0       396            pop acc
+03A4 C083       397            push dph
+03A6 C082       397            push dpl
+03A8 C0E0       397            push acc
+03AA 9000DC     397            mov dptr, #Initial_Message
+03AD 1200B4     397            lcall ?Send_Constant_String
+03B0 D0E0       397            pop acc
+03B2 D082       397            pop dpl
+03B4 D083       397            pop dph
+03B6 C0E0       398            push acc
+03B8 7401       398            mov a, #1
+03BA 14         398            dec a
+03BB 1200C1     398            lcall ?Set_Cursor_1 ; Select column and row
+03BE D0E0       398            pop acc
+03C0 C083       399            push dph
+03C2 C082       399            push dpl
+03C4 C0E0       399            push acc
+03C6 9000DC     399            mov dptr, #Initial_Message
+03C9 1200B4     399            lcall ?Send_Constant_String
+03CC D0E0       399            pop acc
+03CE D082       399            pop dpl
+03D0 D083       399            pop dph
+03D2            400   
+03D2 C002       401            push AR2
+03D4 7A96       401            mov R2, #150
+03D6 120039     401            lcall ?Wait_Milli_Seconds
+03D9 D002       401            pop AR2
+03DB 120B9C     402       lcall option0
+03DE 020423     403   ljmp playmario0
+03E1            404   played:   
+03E1 7403       405   mov a, #0x03
+03E3 B53D03     406   cjne a, score, not3
+03E6 020214     407   ljmp Inc_Done1
+03E9            408   not3:
+03E9 7404       409   mov a, #0x04
+03EB B53D03     410   cjne a, score, not4
+03EE 020214     411   ljmp Inc_Done1
+03F1            412   not4:
+03F1 7405       413   mov a, #0x05
+03F3 B53D03     414   cjne a, score, failed
+03F6            415   
+03F6 020214     416   ljmp Inc_Done1
+03F9            417   failed:
+03F9 C0E0       418            push acc
+03FB 740F       418            mov a, #15
+03FD 14         418            dec a
+03FE 1200BF     418            lcall ?Set_Cursor_2 ; Select column and row
+0401 D0E0       418            pop acc
+0403 C000       419            push ar0
+0405 A83D       419            mov r0, score
+0407 1200C6     419            lcall ?Display_BCD
+040A D000       419            pop ar0
+040C C002       420            push AR2
+040E 7A96       420            mov R2, #150
+0410 120039     420            lcall ?Wait_Milli_Seconds
+0413 D002       420            pop AR2
+0415            421   
+0415 7403       422   mov a, #0x03
+0417 B53E03     423   cjne a, timeringing, again
+041A 0207A8     424   ljmp snooze
+041D 020371     425   again:ljmp ALARMTIME
+0420            426   
+0420            427   SNOOZE1:
+0420            428   
+0420 0207A8     429        ljmp SNOOZE
+0423            430   
+0423            431   
+0423            432   playmario0: ;down down up right left
+0423            433   ;check r
+0423 120891     434   lcall E2
+0426 C002       435            push AR2
+0428 7A32       435            mov R2, #50
+042A 120039     435            lcall ?Wait_Milli_Seconds
+042D D002       435            pop AR2
+042F 120891     436   lcall E2
+0432 C002       437            push AR2
+0434 7A32       437            mov R2, #50
+0436 120039     437            lcall ?Wait_Milli_Seconds
+0439 D002       437            pop AR2
+043B 120891     438   lcall E2
+043E 7418       439   mov a, #0x18
+0440 120083     440   lcall ?WriteCommand
+0443 12083E     441   lcall C2
+0446 C002       442            push AR2
+0448 7A32       442            mov R2, #50
+044A 120039     442            lcall ?Wait_Milli_Seconds
+044D D002       442            pop AR2
+044F 120891     443   lcall E2
+0452 C002       444            push AR2
+0454 7A32       444            mov R2, #50
+0456 120039     444            lcall ?Wait_Milli_Seconds
+0459 D002       444            pop AR2
+045B 12087E     445   lcall G2
+045E C002       446            push AR2
+0460 7A32       446            mov R2, #50
+0462 120039     446            lcall ?Wait_Milli_Seconds
+0465 D002       446            pop AR2
+0467 12082F     447   lcall G1
+046A 7418       448   mov a, #0x18
+046C 120083     449   lcall ?WriteCommand
+046F 12083E     450   lcall C2
+0472 C002       451            push AR2
+0474 7A32       451            mov R2, #50
+0476 120039     451            lcall ?Wait_Milli_Seconds
+0479 D002       451            pop AR2
+047B 12082F     452   lcall G1
+047E C002       453            push AR2
+0480 7A32       453            mov R2, #50
+0482 120039     453            lcall ?Wait_Milli_Seconds
+0485 D002       453            pop AR2
+0487 120821     454   lcall E1
+048A C002       455            push AR2
+048C 7A32       455            mov R2, #50
+048E 120039     455            lcall ?Wait_Milli_Seconds
+0491 D002       455            pop AR2
+0493            456   
+0493 120851     457   lcall A1
+0496 7418       458   mov a, #0x18
+0498 120083     459   lcall ?WriteCommand
+049B 120860     460   lcall B1
+049E C002       461            push AR2
+04A0 7A32       461            mov R2, #50
+04A2 120039     461            lcall ?Wait_Milli_Seconds
+04A5 D002       461            pop AR2
+04A7 12086F     462   lcall Bflat1
+04AA C002       463            push AR2
+04AC 7A32       463            mov R2, #50
+04AE 120039     463            lcall ?Wait_Milli_Seconds
+04B1 D002       463            pop AR2
+04B3 120851     464   lcall A1
+04B6 C002       465            push AR2
+04B8 7A32       465            mov R2, #50
+04BA 120039     465            lcall ?Wait_Milli_Seconds
+04BD D002       465            pop AR2
+04BF 12082F     466   lcall G1
+04C2            467   
+04C2 7418       468   mov a, #0x18
+04C4 120083     469   lcall ?WriteCommand
+04C7 0204D0     470   ljmp playit
+04CA            471   
+04CA            472   
+04CA 020772     473   add1a: ljmp add1
+04CD 02077B     474   add2a: ljmp add2
+04D0            475   
+04D0            476   ;down down up right left
+04D0            477   playit:
+04D0 C002       478            push AR2
+04D2 7A32       478            mov R2, #50
+04D4 120039     478            lcall ?Wait_Milli_Seconds
+04D7 D002       478            pop AR2
+04D9 120891     479   lcall E2
+04DC C002       480            push AR2
+04DE 7A32       480            mov R2, #50
+04E0 120039     480            lcall ?Wait_Milli_Seconds
+04E3 D002       480            pop AR2
+04E5 120891     481   lcall E2
+04E8 20A10C     482     jb p2.1, keepplaying1
+04EB C002       483            push AR2
+04ED 7A32       483            mov R2, #50
+04EF 120039     483            lcall ?Wait_Milli_Seconds
+04F2 D002       483            pop AR2
+04F4 30A1D3     484   jnb p2.1, add1a
+04F7            485   keepplaying1:
+04F7 120891     486   lcall E2
+04FA C002       487            push AR2
+04FC 7A32       487            mov R2, #50
+04FE 120039     487            lcall ?Wait_Milli_Seconds
+0501 D002       487            pop AR2
+0503 12083E     488   lcall C2
+0506 C002       489            push AR2
+0508 7A32       489            mov R2, #50
+050A 120039     489            lcall ?Wait_Milli_Seconds
+050D D002       489            pop AR2
+050F 7418       490       mov a, #0x18
+0511 120083     491   lcall ?WriteCommand
+0514 C002       492            push AR2
+0516 7A32       492            mov R2, #50
+0518 120039     492            lcall ?Wait_Milli_Seconds
+051B D002       492            pop AR2
+051D 120891     493   lcall E2
+0520 C002       494            push AR2
+0522 7A32       494            mov R2, #50
+0524 120039     494            lcall ?Wait_Milli_Seconds
+0527 D002       494            pop AR2
+0529 12087E     495   lcall G2
+052C 20A10C     496   jb p2.1, keepplaying2
+052F C002       497            push AR2
+0531 7A32       497            mov R2, #50
+0533 120039     497            lcall ?Wait_Milli_Seconds
+0536 D002       497            pop AR2
+0538 30A192     498   jnb p2.1, add2a
+053B            499   keepplaying2:
+053B 12082F     500   lcall G1
+053E C002       501            push AR2
+0540 7A32       501            mov R2, #50
+0542 120039     501            lcall ?Wait_Milli_Seconds
+0545 D002       501            pop AR2
+0547 12083E     502   lcall C2
+054A C002       503            push AR2
+054C 7A32       503            mov R2, #50
+054E 120039     503            lcall ?Wait_Milli_Seconds
+0551 D002       503            pop AR2
+0553 7418       504       mov a, #0x18
+0555 120083     505   lcall ?WriteCommand
+0558            506   
+0558 C002       507            push AR2
+055A 7A32       507            mov R2, #50
+055C 120039     507            lcall ?Wait_Milli_Seconds
+055F D002       507            pop AR2
+0561 8006       508   sjmp keepplaying3asd
+0563 020784     509   add3a: ljmp add3
+0566 02078D     510   add4a: ljmp add4
+0569            511   keepplaying3asd:
+0569 12082F     512   lcall G1
+056C C002       513            push AR2
+056E 7A32       513            mov R2, #50
+0570 120039     513            lcall ?Wait_Milli_Seconds
+0573 D002       513            pop AR2
+0575 120821     514   lcall E1
+0578            515   
+0578 20A00C     516       jb p2.0, keepplaying3
+057B C002       517            push AR2
+057D 7A32       517            mov R2, #50
+057F 120039     517            lcall ?Wait_Milli_Seconds
+0582 D002       517            pop AR2
+0584 30A0DC     518   jnb p2.0, add3a
+0587            519   keepplaying3:
+0587 120851     520   lcall A1
+058A C002       521            push AR2
+058C 7A32       521            mov R2, #50
+058E 120039     521            lcall ?Wait_Milli_Seconds
+0591 D002       521            pop AR2
+0593 120860     522   lcall B1
+0596 C002       523            push AR2
+0598 7A32       523            mov R2, #50
+059A 120039     523            lcall ?Wait_Milli_Seconds
+059D D002       523            pop AR2
+059F 7418       524       mov a, #0x18
+05A1 120083     525   lcall ?WriteCommand
+05A4            526   
+05A4 C002       527            push AR2
+05A6 7A32       527            mov R2, #50
+05A8 120039     527            lcall ?Wait_Milli_Seconds
+05AB D002       527            pop AR2
+05AD 12086F     528   lcall Bflat1
+05B0 C002       529            push AR2
+05B2 7A32       529            mov R2, #50
+05B4 120039     529            lcall ?Wait_Milli_Seconds
+05B7 D002       529            pop AR2
+05B9 120851     530   lcall A1
+05BC C002       531            push AR2
+05BE 7A32       531            mov R2, #50
+05C0 120039     531            lcall ?Wait_Milli_Seconds
+05C3 D002       531            pop AR2
+05C5 12082F     532   lcall G1
+05C8 20A30C     533   jb p2.3, keepplaying4
+05CB C002       534            push AR2
+05CD 7A32       534            mov R2, #50
+05CF 120039     534            lcall ?Wait_Milli_Seconds
+05D2 D002       534            pop AR2
+05D4 30A38F     535   jnb p2.3, add4a
+05D7            536   keepplaying4:
+05D7 120891     537   lcall E2
+05DA C002       538            push AR2
+05DC 7A32       538            mov R2, #50
+05DE 120039     538            lcall ?Wait_Milli_Seconds
+05E1 D002       538            pop AR2
+05E3            539   
+05E3 C002       540            push AR2
+05E5 7A32       540            mov R2, #50
+05E7 120039     540            lcall ?Wait_Milli_Seconds
+05EA D002       540            pop AR2
+05EC 7418       541   mov a, #0x18
+05EE 120083     542   lcall ?WriteCommand
+05F1 120891     543   lcall E2
+05F4 C002       544            push AR2
+05F6 7A32       544            mov R2, #50
+05F8 120039     544            lcall ?Wait_Milli_Seconds
+05FB D002       544            pop AR2
+05FD 120891     545   lcall E2
+0600 C002       546            push AR2
+0602 7A32       546            mov R2, #50
+0604 120039     546            lcall ?Wait_Milli_Seconds
+0607 D002       546            pop AR2
+0609 12083E     547   lcall C2
+060C C002       548            push AR2
+060E 7A32       548            mov R2, #50
+0610 120039     548            lcall ?Wait_Milli_Seconds
+0613 D002       548            pop AR2
+0615 20A215     549   jb p2.2, keepplaying5
+0618 C002       550            push AR2
+061A 7A32       550            mov R2, #50
+061C 120039     550            lcall ?Wait_Milli_Seconds
+061F D002       550            pop AR2
+0621 C002       551            push AR2
+0623 7A32       551            mov R2, #50
+0625 120039     551            lcall ?Wait_Milli_Seconds
+0628 D002       551            pop AR2
+062A 30A23C     552   jnb p2.2, add5a
+062D            553   keepplaying5:
+062D 12082F     554   lcall G1
+0630 C002       555            push AR2
+0632 7A32       555            mov R2, #50
+0634 120039     555            lcall ?Wait_Milli_Seconds
+0637 D002       555            pop AR2
+0639 120821     556   lcall E1
+063C C002       557            push AR2
+063E 7A32       557            mov R2, #50
+0640 120039     557            lcall ?Wait_Milli_Seconds
+0643 D002       557            pop AR2
+0645 120851     558   lcall A1
+0648 C002       559            push AR2
+064A 7A32       559            mov R2, #50
+064C 120039     559            lcall ?Wait_Milli_Seconds
+064F D002       559            pop AR2
+0651 120860     560   lcall B1
+0654 C002       561            push AR2
+0656 7A32       561            mov R2, #50
+0658 120039     561            lcall ?Wait_Milli_Seconds
+065B D002       561            pop AR2
+065D 7920       562   mov R1, #0x20
+065F 7418       563   shiftagain: mov a, #0x18
+0661 120083     564   lcall ?WriteCommand
+0664 D9F9       565   djnz R1, shiftagain
+0666 0203E1     566   ljmp played
+0669            567   
+0669            568   add5a: 
+0669 C002       569            push AR2
+066B 7A32       569            mov R2, #50
+066D 120039     569            lcall ?Wait_Milli_Seconds
+0670 D002       569            pop AR2
+0672 C002       570            push AR2
+0674 7A32       570            mov R2, #50
+0676 120039     570            lcall ?Wait_Milli_Seconds
+0679 D002       570            pop AR2
+067B C002       571            push AR2
+067D 7A32       571            mov R2, #50
+067F 120039     571            lcall ?Wait_Milli_Seconds
+0682 D002       571            pop AR2
+0684 C002       572            push AR2
+0686 7A32       572            mov R2, #50
+0688 120039     572            lcall ?Wait_Milli_Seconds
+068B D002       572            pop AR2
+068D 020796     573   ljmp add5
+0690            574   playmario:
+0690 120891     575            lcall E2
+0693 C002       576            push AR2
+0695 7A32       576            mov R2, #50
+0697 120039     576            lcall ?Wait_Milli_Seconds
+069A D002       576            pop AR2
+069C 120B08     577       lcall SHOWTIME
+069F 120891     578            lcall E2
+06A2 C002       579            push AR2
+06A4 7A32       579            mov R2, #50
+06A6 120039     579            lcall ?Wait_Milli_Seconds
+06A9 D002       579            pop AR2
+06AB 120B08     580       lcall SHOWTIME
+06AE 120891     581            lcall E2
+06B1 C002       582            push AR2
+06B3 7A32       582            mov R2, #50
+06B5 120039     582            lcall ?Wait_Milli_Seconds
+06B8 D002       582            pop AR2
+06BA 120B08     583       lcall SHOWTIME
+06BD 12083E     584            lcall C2
+06C0 C002       585            push AR2
+06C2 7A32       585            mov R2, #50
+06C4 120039     585            lcall ?Wait_Milli_Seconds
+06C7 D002       585            pop AR2
+06C9 120B08     586       lcall SHOWTIME
+06CC 120891     587            lcall E2
+06CF C002       588            push AR2
+06D1 7A32       588            mov R2, #50
+06D3 120039     588            lcall ?Wait_Milli_Seconds
+06D6 D002       588            pop AR2
+06D8 120B08     589       lcall SHOWTIME
+06DB 12087E     590            lcall G2
+06DE C002       591            push AR2
+06E0 7A32       591            mov R2, #50
+06E2 120039     591            lcall ?Wait_Milli_Seconds
+06E5 D002       591            pop AR2
+06E7 120B08     592       lcall SHOWTIME
+06EA 12082F     593            lcall G1
+06ED C002       594            push AR2
+06EF 7A32       594            mov R2, #50
+06F1 120039     594            lcall ?Wait_Milli_Seconds
+06F4 D002       594            pop AR2
+06F6 120B08     595       lcall SHOWTIME
+06F9 12083E     596            lcall C2
+06FC C002       597            push AR2
+06FE 7A32       597            mov R2, #50
+0700 120039     597            lcall ?Wait_Milli_Seconds
+0703 D002       597            pop AR2
+0705 120B08     598       lcall SHOWTIME
+0708 12082F     599            lcall G1
+070B C002       600            push AR2
+070D 7A32       600            mov R2, #50
+070F 120039     600            lcall ?Wait_Milli_Seconds
+0712 D002       600            pop AR2
+0714 120B08     601       lcall SHOWTIME
+0717 120821     602            lcall E1
+071A C002       603            push AR2
+071C 7A32       603            mov R2, #50
+071E 120039     603            lcall ?Wait_Milli_Seconds
+0721 D002       603            pop AR2
+0723 120B08     604       lcall SHOWTIME
+0726 120851     605            lcall A1
+0729 C002       606            push AR2
+072B 7A32       606            mov R2, #50
+072D 120039     606            lcall ?Wait_Milli_Seconds
+0730 D002       606            pop AR2
+0732 120B08     607       lcall SHOWTIME
+0735 120860     608            lcall B1
+0738 C002       609            push AR2
+073A 7A32       609            mov R2, #50
+073C 120039     609            lcall ?Wait_Milli_Seconds
+073F D002       609            pop AR2
+0741 120B08     610       lcall SHOWTIME
+0744 12086F     611            lcall Bflat1
+0747 C002       612            push AR2
+0749 7A32       612            mov R2, #50
+074B 120039     612            lcall ?Wait_Milli_Seconds
+074E D002       612            pop AR2
+0750 120B08     613       lcall SHOWTIME
+0753 120851     614            lcall A1
+0756 C002       615            push AR2
+0758 7A32       615            mov R2, #50
+075A 120039     615            lcall ?Wait_Milli_Seconds
+075D D002       615            pop AR2
+075F 120B08     616       lcall SHOWTIME
+0762 12082F     617       lcall G1
+0765 C002       618            push AR2
+0767 7A32       618            mov R2, #50
+0769 120039     618            lcall ?Wait_Milli_Seconds
+076C D002       618            pop AR2
+076E 120B08     619       lcall SHOWTIME
+0771 22         620   ret
+0772            621   
+0772 E53D       622   add1: mov a, score
+0774 2401       623   add a, #0x01
+0776 F53D       624   mov score, a
+0778 0204F7     625   ljmp keepplaying1
+077B            626   add2: 
+077B E53D       627   mov a, score
+077D 2401       628   add a, #0x01
+077F F53D       629   mov score, a
+0781 02053B     630   ljmp keepplaying2
+0784            631   
+0784            632   add3: 
+0784 E53D       633   mov a, score
+0786 2401       634   add a, #0x01
+0788 F53D       635   mov score, a
+078A 020587     636   ljmp keepplaying3
+078D            637   add4: 
+078D E53D       638   mov a, score
+078F 2401       639   add a, #0x01
+0791 F53D       640   mov score, a
+0793 0205D7     641   ljmp keepplaying4
+0796            642   add5: 
+0796 E53D       643   mov a, score
+0798 2401       644   add a, #0x01
+079A F53D       645   mov score, a
+079C 7920       646   mov R1, #0x20
+079E            647   
+079E 7418       648   shiftagain2: mov a, #0x18
+07A0 120083     649   lcall ?WriteCommand
+07A3 D9F9       650   djnz R1, shiftagain2
+07A5 0203E1     651   ljmp played
+07A8            652   snooze: 
+07A8            653   
+07A8 E53B       654   mov a, alarmmin ;add 1 min
+07AA 2405       655            add a, #0x05
+07AC D4         656   da a
+07AD F53B       657            mov alarmmin,a
+07AF            658   
+07AF B4600D     659            cjne a, #0x60,tryagain1
+07B2 753B00     660            moveto00:mov alarmmin, #0x00
+07B5 E53C       661            mov a, alarmhours
+07B7 2401       662            add a, #0x01
+07B9 D4         663            da a
+07BA F53C       664            mov alarmhours,a 
+07BC 020802     665                    ljmp check12
+07BF            666   tryagain1:
+07BF B4610D     667            cjne a, #0x61,tryagain2
+07C2 753B01     668            moveto01:mov alarmmin, #0x01
+07C5 E53C       669            mov a, alarmhours
+07C7 2401       670            add a, #0x01
+07C9 D4         671            da a
+07CA F53C       672            mov alarmhours,a
+07CC 020802     673                    ljmp check12
+07CF            674   tryagain2:
+07CF B4620D     675            cjne a, #0x62,tryagain3
+07D2 753B02     676            moveto02:mov alarmmin, #0x02
+07D5 E53C       677            mov a, alarmhours
+07D7 2401       678            add a, #0x01
+07D9 D4         679            da a
+07DA F53C       680            mov alarmhours,a
+07DC 020802     681                    ljmp check12
+07DF            682   tryagain3:
+07DF B4630D     683            cjne a, #0x63,tryagain4
+07E2            684   
+07E2 753B03     685   moveto03:mov alarmmin, #0x03
+07E5 E53C       686            mov a, alarmhours
+07E7 2401       687            add a, #0x01
+07E9 D4         688            da a
+07EA F53C       689            mov alarmhours,a
+07EC 020802     690                    ljmp check12
+07EF            691   
+07EF            692   tryagain4:
+07EF B4640D     693            cjne a, #0x64,wearegood
+07F2            694   moveto04:
+07F2 753B04     695   mov alarmmin, #0x04
+07F5 E53C       696            mov a, alarmhours
+07F7 2401       697            add a, #0x01
+07F9 D4         698            da a
+07FA F53C       699            mov alarmhours,a
+07FC 020802     700                    ljmp check12
+07FF            701   
+07FF            702   
+07FF            703   
+07FF 020214     704   wearegood:ljmp Inc_Done1
+0802            705   check12: 
+0802 E53C       706   mov a, alarmhours
+0804 B4120D     707   cjne a, #0x12, check13
+0807            708   checkamshiftsnooze:
+0807 E503       709   mov a, alarmday
+0809 7006       710   jnz switchtopm2
+080B 750301     711            mov alarmday, #0x01
+080E 020214     712   ljmp Inc_Done1
+0811 750300     713       switchtopm2: mov alarmday, #0x0
+0814            714   check13:
+0814            715   
+0814 E53C       716   mov a, alarmhours
+0816 B41305     717   cjne a, #0x13, goback
+0819 753C01     718   mov alarmhours, #0x01
+081C 8000       719   sjmp goback
+081E            720   
+081E 020214     721   goback:    ljmp Inc_Done1
+0821            722   E1:;329.63 hz, 1/329.63=0.00303370  turn on and off in that time
+0821 7AA6       723   mov R2, #83*2
+0823 7943       724   LE1: mov R1, #135/2
+0825 B2A6       725            cpl p2.6
+0827            726   
+0827 78A6       727   LE2: mov R0, #166
+0829 D8FE       728   LE3: djnz R0, LE3 ; 3 cycles->3*45.21123ns*166=22.51519us
+082B D9FA       729       djnz R1, LE2 ; 22.51519us*135=3ms
+082D DAF4       730       djnz R2, LE1 ; (3ms)*29=0.25s (approximately)
+082F            731   
+082F            732   G1:;261.63 hz, 1/392.00=0.00255102 turn on and off in that time
+082F 7A42       733   mov R2, #33*2
+0831 7938       734   LG1: mov R1, #113/2
+0833 B2A6       735            cpl p2.6
+0835 78A6       736   LG2: mov R0, #166
+0837 D8FE       737   LG3: djnz R0, LG3 ; 3 cycles->3*45.21123ns*166=22.51519us
+0839 D9FA       738       djnz R1, LG2 ; 22.51519us*113=2.55102ms
+083B DAF4       739       djnz R2, LG1 ; (2ms)*125=0.25s (approximately)
+083D 22         740   ret
+083E            741   
+083E            742   C2:;523.25 hz, 1/523.25=0.00191113 turn on and off in that time
+083E 7B02       743   mov R3, #2
+0840 7A83       744   LC0:mov R2, #131
+0842 792A       745   LC1: mov R1, #85/2
+0844 B2A6       746            cpl p2.6
+0846 78A6       747   LC2: mov R0, #166
+0848 D8FE       748   LC3: djnz R0, LC3 ; 3 cycles->3*45.21123ns*166=22.51519us
+084A D9FA       749       djnz R1, LC2 ; 22.51519us*85=1.91113ms
+084C DAF4       750       djnz R2, LC1 ; (1ms)*125=0.25s (approximately)
+084E DBF0       751       djnz R3,LC0
+0850 22         752   ret      
+0851            753   
+0851            754   
+0851            755   A1:;440.00 hz, 1/440.00=0.00227273 turn on and off in that time
+0851 7ADC       756   mov R2, #110*2
+0853 7932       757   LA1: mov R1, #101/2
+0855 B2A6       758            cpl p2.6
+0857 78A6       759   LA2: mov R0, #166
+0859 D8FE       760   LA3: djnz R0, LA3 ; 3 cycles->3*45.21123ns*166=22.51519us
+085B D9FA       761       djnz R1, LA2 ; 22.51519us*101=2.27273ms
+085D DAF4       762       djnz R2, LA1 ; (1ms)*110=0.25s (approximately)
+085F 22         763   ret      
+0860            764   B1:;493.88 hz, 1/493.88=0.00202478 turn on and off in that time
+0860 7AF6       765   mov R2, #123*2
+0862 792D       766   LB1: mov R1, #90/2
+0864 B2A6       767            cpl p2.6
+0866 78A6       768   LB2: mov R0, #166
+0868 D8FE       769   LB3: djnz R0, LB3 ; 3 cycles->3*45.21123ns*166=22.51519us
+086A D9FA       770       djnz R1, LB2 ; 22.51519us*90=2.02478ms
+086C DAF4       771       djnz R2, LB1 ; (2.02478ms)*123=0.25s (approximately)
+086E 22         772   ret              
+086F            773   Bflat1:;466.16 hz, 1/466.16=0.00214519 turn on and off in that time
+086F 7AEA       774   mov R2, #117*2
+0871 792F       775   LBF1: mov R1, #95/2
+0873 B2A6       776            cpl p2.6
+0875 78A6       777   LBF2: mov R0, #166
+0877 D8FE       778   LBF3: djnz R0, LBF3 ; 3 cycles->3*45.21123ns*166=22.51519us
+0879 D9FA       779       djnz R1, LBF2 ; 22.51519us*95=2.14519ms
+087B DAF4       780       djnz R2, LBF1 ; (2.14519ms)*117=0.25s (approximately)
+087D 22         781   ret
+087E            782   G2:;783.99 hz, 1/783.99=0.00127553 turn on and off in that time
+087E 7B02       783   mov R3, #2
+0880 7AA5       784   LG20:mov R2, #165
+0882 791C       785   LG21: mov R1, #57/2
+0884 B2A6       786            cpl p2.6
+0886 78A6       787   LG22: mov R0, #166
+0888 D8FE       788   LG23: djnz R0, LG23 ; 3 cycles->3*45.21123ns*166=22.51519us
+088A D9FA       789       djnz R1, LG22 ; 22.51519us*57=1.27553ms
+088C DAF4       790       djnz R2, LG21 ; (1.51688ms)*165=0.25s (approximately)
+088E DBF0       791           djnz R3,LG20
+0890 22         792   ret      
+0891            793   E2:;659.25 hz, 1/659.25=0.00151688 turn on and off in that time
+0891 7B02       794   mov R3, #2
+0893 7AA5       795   LE20:mov R2, #165
+0895 7921       796   LE21: mov R1, #67/2
+0897 B2A6       797            cpl p2.6
+0899 78A6       798   LE22: mov R0, #166
+089B D8FE       799   LE23: djnz R0, LE23 ; 3 cycles->3*45.21123ns*166=22.51519us
+089D D9FA       800       djnz R1, LE22 ; 22.51519us*67=1.51688ms
+089F DAF4       801       djnz R2, LE21 ; (1.51688ms)*165=0.25s (approximately)
+08A1 DBF0       802       djnz R3,LE20
+08A3 22         803   ret
+08A4            804   
+08A4            805   
+08A4 30A5FD     806   setalarm:jnb p2.5, $ ;stay until button is no longer pressed
+08A7            807                    
+08A7 8005       808            sjmp setit
+08A9            809            
+08A9            810   
+08A9            811   settime:
+08A9 30A4FD     812            jnb p2.4, $;stay until button is no longer pressed
+08AC C2AD       813   clr ET2  ; Enable timer 2 interrupt
+08AE            814   setit:
+08AE 753600     815            mov position, #0x0 ;temp value for setting
+08B1 850102     816            mov setday, day
+08B4 853539     817            mov sethours, hours
+08B7 853438     818            mov setmin, min
+08BA 853337     819            mov setsecond, second
+08BD            820   
+08BD            821   checkset:
+08BD C0E0       822            push acc
+08BF 7404       822            mov a, #4
+08C1 14         822            dec a
+08C2 1200BF     822            lcall ?Set_Cursor_2 ; Select column and row
+08C5 D0E0       822            pop acc     ; the place in the LCD where we want the BCD counter value
+08C7 C000       823            push ar0
+08C9 A838       823            mov r0, setmin
+08CB 1200C6     823            lcall ?Display_BCD
+08CE D000       823            pop ar0 ; display setmin at 2,4
+08D0 C0E0       824            push acc
+08D2 7401       824            mov a, #1
+08D4 14         824            dec a
+08D5 1200BF     824            lcall ?Set_Cursor_2 ; Select column and row
+08D8 D0E0       824            pop acc     ; the place in the LCD where we want the BCD counter value
+08DA C000       825            push ar0
+08DC A839       825            mov r0, sethours
+08DE 1200C6     825            lcall ?Display_BCD
+08E1 D000       825            pop ar0 ; display setmin at 2,1
+08E3 C0E0       826            push acc
+08E5 7407       826            mov a, #7
+08E7 14         826            dec a
+08E8 1200BF     826            lcall ?Set_Cursor_2 ; Select column and row
+08EB D0E0       826            pop acc     ; the place in the LCD where we want the BCD counter value
+08ED C000       827            push ar0
+08EF A837       827            mov r0, setsecond
+08F1 1200C6     827            lcall ?Display_BCD
+08F4 D000       827            pop ar0 ; display setmin at 2,7
+08F6            828   
+08F6 30A30C     829            jnb p2.3,next1 ;checks which button is pressed
+08F9 C002       830            push AR2
+08FB 7A32       830            mov R2, #50
+08FD 120039     830            lcall ?Wait_Milli_Seconds
+0900 D002       830            pop AR2         ; Debounce delay.  This macro is also in 'LCD_4bit.inc'
+0902 30A352     831            jnb p2.3,setright1 ;checks which button is pressed
+0905            832   next1:
+0905 20A20C     833            jb p2.2, next2
+0908 C002       834            push AR2
+090A 7A32       834            mov R2, #50
+090C 120039     834            lcall ?Wait_Milli_Seconds
+090F D002       834            pop AR2         ; Debounce delay.  This macro is also in 'LCD_4bit.inc'
+0911 30A246     835            jnb p2.2,setleft1 ;checks which button is pressed
+0914            836   next2:
+0914 20A10C     837            jb p2.1,next3
+0917 C002       838            push AR2
+0919 7A32       838            mov R2, #50
+091B 120039     838            lcall ?Wait_Milli_Seconds
+091E D002       838            pop AR2         ; Debounce delay.  This macro is also in 'LCD_4bit.inc'
+0920 30A13A     839            jnb p2.1,setdown1 ;checks which button is pressed
+0923            840   next3:
+0923 20A00C     841            jb p2.0,next4
+0926 C002       842            push AR2
+0928 7A32       842            mov R2, #50
+092A 120039     842            lcall ?Wait_Milli_Seconds
+092D D002       842            pop AR2         ; Debounce delay.  This macro is also in 'LCD_4bit.inc'
+092F 30A02E     843            jnb p2.0,setup1 ;checks which button is pressed
+0932            844   next4:
+0932 C0E0       845            push acc
+0934 7401       845            mov a, #1
+0936 14         845            dec a
+0937 1200C1     845            lcall ?Set_Cursor_1 ; Select column and row
+093A D0E0       845            pop acc 
+093C C083       846            push dph
+093E C082       846            push dpl
+0940 C0E0       846            push acc
+0942 9000DC     846            mov dptr, #Initial_Message
+0945 1200B4     846            lcall ?Send_Constant_String
+0948 D0E0       846            pop acc
+094A D082       846            pop dpl
+094C D083       846            pop dph;clear top row
+094E E536       847            mov a, position
+0950 B40010     848            cjnE a, #0x00, innothours
+0953 7480       849            mov a, #0x80 ;put arrow above hour position
+0955 801E       850            sjmp pointtoposition
+0957 020ADA     851            setright1:ljmp setright;mid jump due to jnz/cjnz 
+095A 020AF1     852   setleft1:ljmp setleft;mid jump due to jnz/cjnz 
+095D 020A5E     853   setdown1:ljmp setdown;mid jump due to jnz/cjnz 
+0960 0209E4     854   setup1:ljmp setup;mid jump due to jnz/cjnz 
+0963            855   
+0963            856   innothours:
+0963 B40104     857            cjnE a, #0x01, innotmin
+0966 7483       858            mov a, #0x83 ;put arrow above min position
+0968 800B       859            sjmp pointtoposition
+096A            860   innotmin:
+096A B40204     861            cjnE a, #0x02, innotsecond
+096D 7486       862            mov a, #0x86 ;put arrow above second position
+096F 8004       863            sjmp pointtoposition
+0971            864   innotsecond:
+0971 7488       865            mov a, #0x88 ;put arrow above am/pm position
+0973 8000       866            sjmp pointtoposition
+0975            867   pointtoposition:
+0975 120083     868       lcall ?WriteCommand
+0978 7400       869            mov a, #0x0 ;draw arrow above said position
+097A 12007E     870       lcall ?WriteData
+097D 30A406     871            jnb p2.4,returnittime ;check for finish button
+0980 30A533     872            jnb p2.5, returnitalarm ;check for finish button
+0983 0208BD     873            ljmp checkset
+0986 30A4FD     874   returnittime: jnb p2.4, $ ;stay until release
+0989 850201     875            mov day, setday ;set counter date
+098C 853935     876            mov hours, sethours
+098F 853834     877            mov min, setmin
+0992 853733     878            mov second, setsecond
+0995 C0E0       879            push acc
+0997 7401       879            mov a, #1
+0999 14         879            dec a
+099A 1200C1     879            lcall ?Set_Cursor_1 ; Select column and row
+099D D0E0       879            pop acc 
+099F C083       880            push dph
+09A1 C082       880            push dpl
+09A3 C0E0       880            push acc
+09A5 9000DC     880            mov dptr, #Initial_Message
+09A8 1200B4     880            lcall ?Send_Constant_String
+09AB D0E0       880            pop acc
+09AD D082       880            pop dpl
+09AF D083       880            pop dph
+09B1 D2AD       881            setb ET2  ; Enable timer 2 interrupt
+09B3 0202DB     882            ljmp loop
+09B6 30A5FD     883   returnitalarm: jnb p2.5, $ ;stay until release
+09B9 850203     884            mov alarmday, setday ;set alarm
+09BC 85393C     885            mov alarmhours, sethours
+09BF 85383B     886            mov alarmmin, setmin
+09C2 85373A     887            mov alarmsecond, setsecond
+09C5 C0E0       888            push acc
+09C7 7401       888            mov a, #1
+09C9 14         888            dec a
+09CA 1200C1     888            lcall ?Set_Cursor_1 ; Select column and row
+09CD D0E0       888            pop acc 
+09CF C083       889            push dph
+09D1 C082       889            push dpl
+09D3 C0E0       889            push acc
+09D5 9000DC     889            mov dptr, #Initial_Message
+09D8 1200B4     889            lcall ?Send_Constant_String
+09DB D0E0       889            pop acc
+09DD D082       889            pop dpl
+09DF D083       889            pop dph
+09E1            890   
+09E1 0202DB     891            ljmp loop
+09E4            892   setup:   
+09E4 30A0FD     893            jnb p2.0, $  ;stay until release
+09E7 E536       894            mov a, position
+09E9 B40016     895            CJNE a, #0x00,nothoursU ;find position
+09EC E539       896            mov a, sethours ;position in hours
+09EE B41207     897            CJNE a, #0x12,movuphour ;set to 00 if 12
+09F1 7401       898            mov a, #0x01
+09F3 F539       899            mov sethours, a
+09F5 0208BD     900            ljmp checkset
+09F8            901   movuphour:
+09F8 E539       902            mov a, sethours ;add 1 to hour
+09FA 2401       903            add a, #0x01
+09FC D4         904            da a
+09FD F539       905            mov sethours,a
+09FF 0208BD     906            ljmp checkset
+0A02            907   nothoursU:
+0A02 E536       908            mov a, position 
+0A04 B40116     909            CJNE a, #0x01, notminsU ;find position
+0A07 E538       910            mov a, setmin ;position in mins
+0A09 B45907     911            CJNE a, #0x59, movupmin ;set to 00 if 59
+0A0C 7400       912            mov a, #0x00
+0A0E F538       913            mov setmin,a
+0A10 0208BD     914            ljmp checkset
+0A13            915   movupmin:
+0A13 E538       916            mov a, setmin ;add 1 min
+0A15 2401       917            add a, #0x01
+0A17 D4         918            da a
+0A18 F538       919            mov setmin,a
+0A1A 0208BD     920            ljmp checkset
+0A1D            921   notminsU:
+0A1D E536       922            mov a, position 
+0A1F B40217     923            CJNE a, #0x02, notsecondsU ;find position
+0A22 E537       924            mov a, setsecond;position in second
+0A24 B45908     925            CJNE a, #0x59, movupsecond ;set to 00 if 59
+0A27 7400       926            mov a, #0x00
+0A29 D4         927            da a
+0A2A F537       928            mov setsecond, a
+0A2C 0208BD     929            ljmp checkset
+0A2F            930   movupsecond:
+0A2F E537       931            mov a, setsecond ;add 1 sec
+0A31 2401       932            add a, #0x01
+0A33 D4         933            da a
+0A34 F537       934            mov setsecond,a
+0A36 0208BD     935            ljmp checkset
+0A39            936   notsecondsU:
+0A39 020AB2     937            ljmp notsecondsd;mid jump due to jnz/cjne
+0A3C            938   switch:
+0A3C 750201     939            mov setday, #0x1 ;set am
+0A3F C0E0       940            push acc
+0A41 7409       940            mov a, #9
+0A43 14         940            dec a
+0A44 1200BF     940            lcall ?Set_Cursor_2 ; Select column and row
+0A47 D0E0       940            pop acc
+0A49 C083       941            push dph
+0A4B C082       941            push dpl
+0A4D C0E0       941            push acc
+0A4F 9000F8     941            mov dptr, #AMMESSAGE
+0A52 1200B4     941            lcall ?Send_Constant_String
+0A55 D0E0       941            pop acc
+0A57 D082       941            pop dpl
+0A59 D083       941            pop dph
+0A5B 0208BD     942            ljmp checkset
+0A5E            943   setdown:         
+0A5E 30A1FD     944            jnb p2.1, $ ;stay untill button is release
+0A61 E536       945            mov a, position
+0A63 B40018     946            CJNE a, #0x00,nothoursD ;find position
+0A66 E539       947            mov a, sethours ;in hours
+0A68 B40006     948            CJNE a, #0x00,movdownhour 
+0A6B 753912     949            mov sethours, #0x12 ;set hours to 12 if 00
+0A6E 0208BD     950            ljmp checkset
+0A71            951   movdownhour:
+0A71 E539       952            mov a, sethours
+0A73 2499       953            add a, #0x99 ;sub 1 from hours
+0A75 D4         954            da a
+0A76 F539       955            mov sethours,a
+0A78 0208BD     956            ljmp checkset
+0A7B 020A3C     957   switch1:ljmp switch ;mid jmp due to jnz/cjne
+0A7E            958   nothoursD:
+0A7E E536       959            mov a, position
+0A80 B40115     960            CJNE a, #0x01, notminsD ;find position
+0A83 E538       961            mov a, setmin ;position in min
+0A85 B40006     962            CJNE a, #0x00, movdownmin 
+0A88 753859     963            mov setmin, #0x59 ;set min to 59 if 00
+0A8B 0208BD     964            ljmp checkset
+0A8E            965   movdownmin:
+0A8E E538       966            mov a, setmin ;sub 1 from min
+0A90 2499       967            add a, #0x99
+0A92 D4         968            da a
+0A93 F538       969            mov setmin,a
+0A95 0208BD     970            ljmp checkset
+0A98            971   notminsD:
+0A98 E536       972            mov a, position
+0A9A B40215     973            CJNE a, #0x02, notsecondsD ;find position
+0A9D E537       974            mov a, setsecond ;position in second
+0A9F B40006     975            CJNE a, #0x00, movdownseconds
+0AA2 753759     976            mov setsecond,#0x59 ;set seconds to 59 if 00
+0AA5 0208BD     977            ljmp checkset
+0AA8            978   movdownseconds:
+0AA8 E537       979            mov a, setsecond
+0AAA 2499       980            add a, #0x99 ;sub 1 from second
+0AAC D4         981            da a
+0AAD F537       982            mov setsecond,a
+0AAF 0208BD     983            ljmp checkset
+0AB2            984   notsecondsD:
+0AB2 E502       985            mov a, setday ; position in day
+0AB4 B401C4     986            CJNE a, #0x01, switch1 
+0AB7 7400       987            mov a, #0x0 ;set to pm if am
+0AB9 F502       988            mov setday,a
+0ABB C0E0       989            push acc
+0ABD 7409       989            mov a, #9
+0ABF 14         989            dec a
+0AC0 1200BF     989            lcall ?Set_Cursor_2 ; Select column and row
+0AC3 D0E0       989            pop acc
+0AC5 C083       990            push dph
+0AC7 C082       990            push dpl
+0AC9 C0E0       990            push acc
+0ACB 9000FB     990            mov dptr, #PMMESSAGE
+0ACE 1200B4     990            lcall ?Send_Constant_String
+0AD1 D0E0       990            pop acc
+0AD3 D082       990            pop dpl
+0AD5 D083       990            pop dph
+0AD7 0208BD     991            ljmp checkset
+0ADA            992   setright:
+0ADA 30A3FD     993            jnb p2.3, $ ;stay untill button is release
+0ADD E536       994            mov a, position ;find position
+0ADF B40306     995            CJNE a, #0x03,movright 
+0AE2 753600     996            mov position, #0x00 ; mov position to hours spot if in day
+0AE5 0208BD     997            ljmp checkset
+0AE8            998   movright:
+0AE8 E536       999            mov a, position ;mov to the right
+0AEA 2401      1000            add a, #0x01
+0AEC F536      1001            mov position,a
+0AEE 0208BD    1002            ljmp checkset
+0AF1           1003   setleft:
+0AF1 30A2FD    1004            jnb p2.2, $ ;stay until button is release
+0AF4 E536      1005            mov a, position ;find position
+0AF6 B40006    1006            CJNE a, #0x00,movleft 
+0AF9 753603    1007            mov position, #0x03 ;mov position to days if in hours
+0AFC 0208BD    1008            ljmp checkset
+0AFF           1009   movleft:
+0AFF E536      1010            mov a, position ;mov position to left
+0B01 9401      1011            subb a, #0x01
+0B03 F536      1012            mov position,a
+0B05 0208BD    1013            ljmp checkset
+0B08           1014            
+0B08           1015            SHOWTIME:
+0B08 C0E0      1016            push acc
+0B0A 7401      1016            mov a, #1
+0B0C 14        1016            dec a
+0B0D 1200BF    1016            lcall ?Set_Cursor_2 ; Select column and row
+0B10 D0E0      1016            pop acc
+0B12 C083      1017            push dph
+0B14 C082      1017            push dpl
+0B16 C0E0      1017            push acc
+0B18 9000ED    1017            mov dptr, #DISPLAYTIME
+0B1B 1200B4    1017            lcall ?Send_Constant_String
+0B1E D0E0      1017            pop acc
+0B20 D082      1017            pop dpl
+0B22 D083      1017            pop dph
+0B24 C0E0      1018            push acc
+0B26 7407      1018            mov a, #7
+0B28 14        1018            dec a
+0B29 1200BF    1018            lcall ?Set_Cursor_2 ; Select column and row
+0B2C D0E0      1018            pop acc
+0B2E           1018        ; the place in the LCD where we want the BCD counter value
+0B2E C000      1019            push ar0
+0B30 A833      1019            mov r0, second
+0B32 1200C6    1019            lcall ?Display_BCD
+0B35 D000      1019            pop ar0 ;display second at 2,7
+0B37 C0E0      1020            push acc
+0B39 7404      1020            mov a, #4
+0B3B 14        1020            dec a
+0B3C 1200BF    1020            lcall ?Set_Cursor_2 ; Select column and row
+0B3F D0E0      1020            pop acc     ; the place in the LCD where we want the BCD counter value
+0B41 C000      1021            push ar0
+0B43 A834      1021            mov r0, min
+0B45 1200C6    1021            lcall ?Display_BCD
+0B48 D000      1021            pop ar0 ; display min at 2,4
+0B4A C0E0      1022            push acc
+0B4C 7401      1022            mov a, #1
+0B4E 14        1022            dec a
+0B4F 1200BF    1022            lcall ?Set_Cursor_2 ; Select column and row
+0B52 D0E0      1022            pop acc     ; the place in the LCD where we want the BCD counter value
+0B54 C000      1023            push ar0
+0B56 A835      1023            mov r0, hours
+0B58 1200C6    1023            lcall ?Display_BCD
+0B5B D000      1023            pop ar0 ; display hours at 2,1
+0B5D           1024   
+0B5D C0E0      1025            push acc
+0B5F 7409      1025            mov a, #9
+0B61 14        1025            dec a
+0B62 1200BF    1025            lcall ?Set_Cursor_2 ; Select column and row
+0B65 D0E0      1025            pop acc
+0B67 E501      1026       mov a, day
+0B69           1027       
+0B69 7014      1028       JNZ DISPLAYAM
+0B6B C083      1029            push dph
+0B6D C082      1029            push dpl
+0B6F C0E0      1029            push acc
+0B71 9000FB    1029            mov dptr, #PMMESSAGE
+0B74 1200B4    1029            lcall ?Send_Constant_String
+0B77 D0E0      1029            pop acc
+0B79 D082      1029            pop dpl
+0B7B D083      1029            pop dph; display am/pm at 2,9
+0B7D 801C      1030       sjmp returnnow
+0B7F           1031   DISPLAYAM:
+0B7F C0E0      1032            push acc
+0B81 7409      1032            mov a, #9
+0B83 14        1032            dec a
+0B84 1200BF    1032            lcall ?Set_Cursor_2 ; Select column and row
+0B87 D0E0      1032            pop acc
+0B89 C083      1033            push dph
+0B8B C082      1033            push dpl
+0B8D C0E0      1033            push acc
+0B8F 9000F8    1033            mov dptr, #AMMESSAGE
+0B92 1200B4    1033            lcall ?Send_Constant_String
+0B95 D0E0      1033            pop acc
+0B97 D082      1033            pop dpl
+0B99 D083      1033            pop dph; display am/pm at 2,9
+0B9B           1034   
+0B9B 22        1035   returnnow: ret
+0B9C           1036   
+0B9C C083      1037            push dph
+0B9E C082      1037            push dpl
+0BA0 C0E0      1037            push acc
+0BA2 9000DC    1037            mov dptr, #Initial_Message
+0BA5 1200B4    1037            lcall ?Send_Constant_String
+0BA8 D0E0      1037            pop acc
+0BAA D082      1037            pop dpl
+0BAC D083      1037            pop dph
+0BAE C002      1038            push AR2
+0BB0 7A32      1038            mov R2, #50
+0BB2 120039    1038            lcall ?Wait_Milli_Seconds
+0BB5 D002      1038            pop AR2
+0BB7 C0E0      1039            push acc
+0BB9 7401      1039            mov a, #1
+0BBB 14        1039            dec a
+0BBC 1200C1    1039            lcall ?Set_Cursor_1 ; Select column and row
+0BBF D0E0      1039            pop acc
+0BC1 C083      1040            push dph
+0BC3 C082      1040            push dpl
+0BC5 C0E0      1040            push acc
+0BC7 900103    1040            mov dptr, #ready
+0BCA 1200B4    1040            lcall ?Send_Constant_String
+0BCD D0E0      1040            pop acc
+0BCF D082      1040            pop dpl
+0BD1 D083      1040            pop dph
+0BD3 C002      1041            push AR2
+0BD5 7AFA      1041            mov R2, #250
+0BD7 120039    1041            lcall ?Wait_Milli_Seconds
+0BDA D002      1041            pop AR2
+0BDC C002      1042            push AR2
+0BDE 7AFA      1042            mov R2, #250
+0BE0 120039    1042            lcall ?Wait_Milli_Seconds
+0BE3 D002      1042            pop AR2
+0BE5 C0E0      1043            push acc
+0BE7 7401      1043            mov a, #1
+0BE9 14        1043            dec a
+0BEA 1200C1    1043            lcall ?Set_Cursor_1 ; Select column and row
+0BED D0E0      1043            pop acc
+0BEF C083      1044            push dph
+0BF1 C082      1044            push dpl
+0BF3 C0E0      1044            push acc
+0BF5 9000DC    1044            mov dptr, #Initial_Message
+0BF8 1200B4    1044            lcall ?Send_Constant_String
+0BFB D0E0      1044            pop acc
+0BFD D082      1044            pop dpl
+0BFF D083      1044            pop dph
+0C01 C002      1045            push AR2
+0C03 7A32      1045            mov R2, #50
+0C05 120039    1045            lcall ?Wait_Milli_Seconds
+0C08 D002      1045            pop AR2
+0C0A 7484      1046       mov a, #0x84 ;down down up right left
+0C0C 120083    1047       lcall ?WriteCommand
+0C0F 7400      1048            mov a, #0x0 ;draw arrow above said position
+0C11 12007E    1049       lcall ?WriteData
+0C14 7400      1050            mov a, #0x0 ;draw arrow above said position
+0C16 12007E    1051       lcall ?WriteData
+0C19 7401      1052            mov a, #0x1 ;draw arrow above said position
+0C1B 12007E    1053       lcall ?WriteData
+0C1E 747E      1054            mov a, #0x7E ;draw arrow above said position
+0C20 12007E    1055       lcall ?WriteData
+0C23 747F      1056            mov a, #0x7F ;draw arrow above said position
+0C25 12007E    1057       lcall ?WriteData
+0C28 22        1058       ret
+0C29           1059   EN
